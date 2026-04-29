@@ -159,8 +159,16 @@ def _metrics(equity):
 def _save_plot(series_by_label, relative_path):
     os.makedirs(os.path.dirname(relative_path), exist_ok=True)
     plt.figure(figsize=(13, 7))
-    for label, series in series_by_label.items():
-        plt.plot(series.index, series.values, label=label, linewidth=2 if label != "TQQQ Buy & Hold" else 1.6)
+    styles = {
+        "TQQQ Buy & Hold": {"color": "#2ca02c", "linewidth": 1.5, "alpha": 0.75, "linestyle": "-"},
+        "No Spike Protection": {"color": "#ff7f0e", "linewidth": 2.0, "alpha": 0.75, "linestyle": "--"},
+        "Partial Spike Reduction": {"color": "#1f77b4", "linewidth": 2.8, "alpha": 0.95, "linestyle": "-"},
+    }
+    # Draw the partial-reduction curve last so overlapping early sections are visible.
+    plot_order = ["TQQQ Buy & Hold", "No Spike Protection", "Partial Spike Reduction"]
+    for label in plot_order:
+        series = series_by_label[label]
+        plt.plot(series.index, series.values, label=label, **styles[label])
     plt.yscale("log")
     plt.title("TimesFM VIX Squeeze: Partial Spike Reduction vs No Spike Protection")
     plt.ylabel("Equity, log scale")
