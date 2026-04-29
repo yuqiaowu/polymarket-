@@ -32,18 +32,18 @@ def run_vix_squeeze_backtest():
 
     equity_strategy = [1.0]
     equity_benchmark = [1.0]
-    positions = ["HEDGE"]
+    positions = [0.0]
     trades = []
-    current_position = "HEDGE"
+    current_exposure = 0.0
 
     for i in range(1, len(df)):
         ret = _safe_return(df["tqqq_return"].iloc[i])
 
         # A. Today's return is earned by yesterday's position.
-        next_equity = equity_strategy[-1] if current_position == "HEDGE" else equity_strategy[-1] * (1 + ret)
+        next_equity = equity_strategy[-1] * (1 + current_exposure * ret)
         equity_strategy.append(next_equity)
         equity_benchmark.append(equity_benchmark[-1] * (1 + ret))
-        positions.append(current_position)
+        positions.append(current_exposure)
 
         # B. Today's close/VIX data can only decide tomorrow's position.
         if i + 1 < CONTEXT_DAYS:
@@ -54,20 +54,27 @@ def run_vix_squeeze_backtest():
         forecast = forecaster.forecast(context_window, HORIZON_DAYS)
         signal = engine.analyze_timesfm(vix_history, forecast)
 
-        if signal.action in {"HEDGE", "LONG_TQQQ"} and signal.action != current_position:
-            equity_strategy[-1] *= 1 - TRANSACTION_COST
+        target_exposure = signal.target_exposure
+        if signal.action == "REDUCE_RISK":
+            target_exposure = min(current_exposure, signal.target_exposure)
+
+        if target_exposure >= 0.0 and target_exposure != current_exposure:
+            turnover = abs(signal.target_exposure - current_exposure)
+            equity_strategy[-1] *= 1 - TRANSACTION_COST * turnover
             trades.append(
                 {
                     "date": df.index[i].date().isoformat(),
-                    "from": current_position,
-                    "to": signal.action,
+                    "from_exposure": round(current_exposure, 2),
+                    "to_exposure": round(target_exposure, 2),
+                    "action": signal.action,
+                    "reason": signal.reason,
                     "vix": round(float(signal.vix_current), 2),
                     "q50_vix_return_pct": round(float(signal.vix_forecast_mean), 2),
                     "slope_3d": round(float(signal.vix_forecast_slope), 2),
                     "confidence": round(float(signal.confidence), 2),
                 }
             )
-            current_position = signal.action
+            current_exposure = target_exposure
 
     result = _summarize(
         strategy_name="TimesFM VIX Squeeze",
@@ -118,7 +125,7 @@ def _summarize(strategy_name, df, equity_strategy, equity_benchmark, positions, 
     mdd = _max_drawdown(strategy)
     benchmark_mdd = _max_drawdown(benchmark)
     sharpe = 0.0 if daily_returns.std() == 0 else daily_returns.mean() / daily_returns.std() * np.sqrt(252)
-    exposure = sum(1 for position in positions if position == "LONG_TQQQ") / len(positions)
+    exposure = sum(positions) / len(positions)
     return {
         "strategy": strategy_name,
         "period": f"{strategy.index[0].date()} to {strategy.index[-1].date()}",

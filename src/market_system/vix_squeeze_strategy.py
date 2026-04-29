@@ -13,6 +13,8 @@ class VixSqueezeSignal:
     vix_forecast_peak_detected: bool
     action: str  # LONG_TQQQ, HEDGE, NO_TRADE
     confidence: float
+    target_exposure: float = 0.0
+    reason: str = ""
 
 class VixSqueezeEngine:
     """
@@ -46,6 +48,8 @@ class VixSqueezeEngine:
 
         action = "NO_TRADE"
         confidence = 0.0
+        target_exposure = 0.0
+        reason = "NO_SIGNAL"
 
         # DECISION LOGIC
         # Signal 1: The Squeeze Buy (VIX is high, but the 'fever' is breaking)
@@ -53,11 +57,15 @@ class VixSqueezeEngine:
             action = "LONG_TQQQ"
             # Higher slope downwards = higher confidence in mean reversion
             confidence = min(0.95, 0.45 + abs(slope) / 8.0)
+            target_exposure = 1.0
+            reason = "SQUEEZE_BUY"
         
         # Signal 2: The Hedge (VIX is too low, complacency is high, model sees a spike)
         elif curr_vix < self.low_vix and is_spiking:
             action = "HEDGE"
             confidence = min(0.9, 0.4 + abs(slope) / 10.0)
+            target_exposure = 0.0
+            reason = "COMPLACENCY_EXIT"
 
         return VixSqueezeSignal(
             vix_current=curr_vix,
@@ -65,7 +73,9 @@ class VixSqueezeEngine:
             vix_forecast_slope=slope,
             vix_forecast_peak_detected=is_peaking,
             action=action,
-            confidence=confidence
+            confidence=confidence,
+            target_exposure=target_exposure,
+            reason=reason,
         )
 
     def analyze_timesfm(self, vix_history: List[float], forecast: TimesFMForecast, vol_ratio: float = 1.0) -> VixSqueezeSignal:
@@ -93,33 +103,63 @@ class VixSqueezeEngine:
 
         action = "NO_TRADE"
         confidence = 0.0
+        target_exposure = 0.0
+        reason = "NO_SIGNAL"
 
         # --- AI-CONFIRMED VIX SQUEEZE STRATEGY ---
-        # 1. Spike Protection: if VIX slope suddenly jumps, exit regardless of level.
+        # 1. Spike Protection: if VIX slope suddenly jumps, reduce exposure unless
+        # TimesFM strongly disagrees and sees VIX rolling over.
         if slope_3d > 1.5:
             action = "HEDGE"
             confidence = 0.95
+            reason = "SPIKE_FULL_HEDGE"
+            target_exposure = 0.0
+            if q50 < -20.0 or prob_pos < 0.25:
+                action = "REDUCE_RISK"
+                target_exposure = 0.75
+                confidence = 0.75
+                reason = "SPIKE_TIMESFM_VERY_STRONG_REVERSAL"
+            elif q50 < -12.0 or prob_pos < 0.35:
+                action = "REDUCE_RISK"
+                target_exposure = 0.50
+                confidence = 0.80
+                reason = "SPIKE_TIMESFM_STRONG_REVERSAL"
+            elif q50 < -8.0 or prob_pos < 0.40:
+                action = "REDUCE_RISK"
+                target_exposure = 0.25
+                confidence = 0.85
+                reason = "SPIKE_TIMESFM_MODERATE_REVERSAL"
             
         # 2. Squeeze Buy: extreme fear, but AI sees VIX topping and rolling over.
         elif curr_vix > self.high_vix:
             if is_peaking:
                 action = "LONG_TQQQ"
                 confidence = 0.95
+                target_exposure = 1.0
+                reason = "SQUEEZE_BUY"
             else:
                 action = "NO_CHANGE"
+                target_exposure = -1.0
+                reason = "HIGH_VIX_NO_AI_CONFIRMATION"
         
         # 3. Complacency Exit: low VIX, but AI sees VIX bottoming and rising.
         elif curr_vix < self.low_vix:
             if is_spiking:
                 action = "HEDGE"
                 confidence = 0.9
+                target_exposure = 0.0
+                reason = "COMPLACENCY_EXIT"
             else:
                 action = "NO_CHANGE"
+                target_exposure = -1.0
+                reason = "LOW_VIX_NO_AI_CONFIRMATION"
                 
         # 4. ZONE: NOISE (15 <= VIX <= 25) -> Maintain current state
         else:
             action = "NO_CHANGE"
             confidence = 0.5
+            target_exposure = -1.0
+            reason = "NOISE_MAINTAIN"
 
         return VixSqueezeSignal(
             vix_current=curr_vix,
@@ -127,5 +167,7 @@ class VixSqueezeEngine:
             vix_forecast_slope=slope_3d,
             vix_forecast_peak_detected=is_peaking,
             action=action,
-            confidence=confidence
+            confidence=confidence,
+            target_exposure=target_exposure,
+            reason=reason,
         )
