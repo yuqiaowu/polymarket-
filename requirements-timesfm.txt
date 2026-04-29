@@ -1,0 +1,16 @@
+# Optional dependencies for TimesFM walk-forward backtests.
+# Install separately because model/runtime dependencies are heavy.
+#
+# Recommended:
+#   python -m pip install -r requirements.txt
+#   python -m pip install --index-url https://pypi.org/simple -r requirements-timesfm.txt
+#
+# If torch installation fails on your machine, install the platform-specific
+# build from https://pytorch.org/get-started/locally/ first, then rerun this.
+torch>=2.2.0
+numpy>=1.26.0
+
+# Do not use the old PyPI `timesfm==1.0.0` package for this project; it does
+# not expose the TimesFM 2.5 torch API used by scripts/run_timesfm_backtest.py.
+# The current Google Research code is installed from GitHub.
+timesfm[torch] @ git+https://github.com/google-research/timesfm.git
