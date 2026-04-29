@@ -78,6 +78,9 @@ def run_backtest(args: argparse.Namespace) -> dict:
         },
         "data_status": data_status,
         "summary": summary,
+        "calibration": _calibration(forecast_rows),
+        "ranking_evaluation": _ranking_evaluation(forecast_rows),
+        "by_year": _by_year(forecast_rows),
         "baselines": _build_baselines(clean_bars_by_symbol, args),
         "grid_search": _grid_search(forecast_rows, args) if args.grid else [],
         "latest_forecast_matrix": _latest_forecast_matrix(forecast_rows, args),
@@ -298,6 +301,104 @@ def _summary_from_returns(returns: list[float]) -> dict:
     }
 
 
+def _calibration(rows: list[BacktestTrade]) -> dict:
+    clean = [
+        row
+        for row in rows
+        if row.forecast.get("probability_positive") is not None
+        and row.forecast.get("q50_return_pct") is not None
+    ]
+    buckets = []
+    for low, high in [(0.0, 0.45), (0.45, 0.50), (0.50, 0.55), (0.55, 0.60), (0.60, 1.01)]:
+        bucket = [
+            row
+            for row in clean
+            if low <= float(row.forecast.get("probability_positive")) < high
+        ]
+        returns = [row.gross_return_pct for row in bucket]
+        buckets.append(
+            {
+                "probability_bucket": f"{low:.2f}-{min(high, 1.0):.2f}",
+                "count": len(bucket),
+                "avg_probability_positive": _round_optional(
+                    sum(float(row.forecast.get("probability_positive")) for row in bucket) / len(bucket)
+                )
+                if bucket
+                else None,
+                "actual_positive_rate": _round_optional(len([value for value in returns if value > 0]) / len(returns))
+                if returns
+                else None,
+                "avg_actual_return_pct": _round_optional(sum(returns) / len(returns)) if returns else None,
+            }
+        )
+    q50_positive = [row for row in clean if float(row.forecast.get("q50_return_pct")) > 0]
+    q50_negative = [row for row in clean if float(row.forecast.get("q50_return_pct")) < 0]
+    return {
+        "row_count": len(clean),
+        "probability_buckets": buckets,
+        "q50_positive": _directional_quality(q50_positive),
+        "q50_negative": _directional_quality(q50_negative, expect_negative=True),
+    }
+
+
+def _directional_quality(rows: list[BacktestTrade], expect_negative: bool = False) -> dict:
+    returns = [row.gross_return_pct for row in rows]
+    if not returns:
+        return {"count": 0, "hit_rate": None, "avg_actual_return_pct": None}
+    hits = [value for value in returns if value < 0] if expect_negative else [value for value in returns if value > 0]
+    return {
+        "count": len(returns),
+        "hit_rate": _round_optional(len(hits) / len(returns)),
+        "avg_actual_return_pct": _round_optional(sum(returns) / len(returns)),
+    }
+
+
+def _ranking_evaluation(rows: list[BacktestTrade]) -> dict:
+    by_date: dict[str, list[BacktestTrade]] = {}
+    for row in rows:
+        by_date.setdefault(row.decision_date, []).append(row)
+
+    evaluated = []
+    for decision_date, group in sorted(by_date.items()):
+        symbols = {row.symbol for row in group}
+        if not set(DEFAULT_SYMBOLS).issubset(symbols):
+            continue
+        ranked_by_forecast = sorted(
+            group,
+            key=lambda row: float(row.forecast.get("probability_positive") or 0.0),
+            reverse=True,
+        )
+        ranked_by_actual = sorted(group, key=lambda row: row.gross_return_pct, reverse=True)
+        top_forecast = ranked_by_forecast[0]
+        top_actual = ranked_by_actual[0]
+        evaluated.append(
+            {
+                "decision_date": decision_date,
+                "top_forecast_symbol": top_forecast.symbol,
+                "top_actual_symbol": top_actual.symbol,
+                "top_forecast_actual_return_pct": top_forecast.gross_return_pct,
+                "top_actual_return_pct": top_actual.gross_return_pct,
+                "hit": top_forecast.symbol == top_actual.symbol,
+            }
+        )
+    returns = [item["top_forecast_actual_return_pct"] for item in evaluated]
+    hits = [item for item in evaluated if item["hit"]]
+    return {
+        "evaluated_dates": len(evaluated),
+        "top1_hit_rate": _round_optional(len(hits) / len(evaluated)) if evaluated else None,
+        "top_forecast_avg_return_pct": _round_optional(sum(returns) / len(returns)) if returns else None,
+        "top_forecast_total_compounded_return_pct": _compound_return(returns),
+        "recent": evaluated[-10:],
+    }
+
+
+def _by_year(rows: list[BacktestTrade]) -> dict:
+    by_year: dict[str, list[BacktestTrade]] = {}
+    for row in rows:
+        by_year.setdefault(row.decision_date[:4], []).append(row)
+    return {year: _summary(items) for year, items in sorted(by_year.items())}
+
+
 def _latest_forecast_matrix(rows: list[BacktestTrade], args: argparse.Namespace) -> dict:
     latest_by_symbol: dict[str, BacktestTrade] = {}
     for row in rows:
@@ -360,6 +461,58 @@ def render_markdown(result: dict) -> str:
             f"| {symbol} | {payload.get('trades', 0)} | {_fmt_pct_ratio(payload.get('win_rate'))} | "
             f"{_fmt_pct(payload.get('avg_return_pct'))} | {_fmt_pct(payload.get('total_compounded_return_pct'))} |"
         )
+    calibration = result.get("calibration", {})
+    lines.extend(
+        [
+            "",
+            "## Calibration",
+            "",
+            f"- Rows evaluated: `{calibration.get('row_count', 0)}`",
+            f"- q50 > 0 hit rate: `{_fmt_pct_ratio(calibration.get('q50_positive', {}).get('hit_rate'))}` "
+            f"avg actual `{_fmt_pct(calibration.get('q50_positive', {}).get('avg_actual_return_pct'))}`",
+            f"- q50 < 0 hit rate: `{_fmt_pct_ratio(calibration.get('q50_negative', {}).get('hit_rate'))}` "
+            f"avg actual `{_fmt_pct(calibration.get('q50_negative', {}).get('avg_actual_return_pct'))}`",
+            "",
+            "| Prob+ bucket | Count | Avg prob+ | Actual positive rate | Avg actual return |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for bucket in calibration.get("probability_buckets", []):
+        lines.append(
+            f"| `{bucket.get('probability_bucket')}` | {bucket.get('count', 0)} | "
+            f"{_fmt_pct_ratio(bucket.get('avg_probability_positive'))} | "
+            f"{_fmt_pct_ratio(bucket.get('actual_positive_rate'))} | "
+            f"{_fmt_pct(bucket.get('avg_actual_return_pct'))} |"
+        )
+    ranking_eval = result.get("ranking_evaluation", {})
+    lines.extend(
+        [
+            "",
+            "## Ranking Evaluation",
+            "",
+            f"- Evaluated dates: `{ranking_eval.get('evaluated_dates', 0)}`",
+            f"- Top-1 hit rate: `{_fmt_pct_ratio(ranking_eval.get('top1_hit_rate'))}`",
+            f"- Top forecast avg return: `{_fmt_pct(ranking_eval.get('top_forecast_avg_return_pct'))}`",
+            f"- Top forecast compounded return: `{_fmt_pct(ranking_eval.get('top_forecast_total_compounded_return_pct'))}`",
+        ]
+    )
+    by_year = result.get("by_year", {})
+    if by_year:
+        lines.extend(
+            [
+                "",
+                "## By Year",
+                "",
+                "| Year | Forecast rows | Directional trades | Win rate | Avg return | Compounded |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for year, payload in by_year.items():
+            lines.append(
+                f"| {year} | {payload.get('all_rows', 0)} | {payload.get('directional_trades', 0)} | "
+                f"{_fmt_pct_ratio(payload.get('win_rate'))} | {_fmt_pct(payload.get('avg_return_pct'))} | "
+                f"{_fmt_pct(payload.get('total_compounded_return_pct'))} |"
+            )
     matrix = result.get("latest_forecast_matrix", {})
     matrix_symbols = matrix.get("symbols", {})
     if matrix_symbols:
