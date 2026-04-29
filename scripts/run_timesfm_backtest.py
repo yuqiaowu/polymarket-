@@ -2,27 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 
 from market_system.config import REPORTS_DIR, TRADE_SYMBOLS
 from market_system.market_data import PriceBar, fetch_daily_bars
+from market_system.timesfm_strategy import (
+    TimesFMForecast,
+    TimesFMForecaster,
+    TimesFMUnavailable,
+    build_timesfm_forecast_matrix,
+)
 
 
 DEFAULT_MODEL_ID = "google/timesfm-2.5-200m-pytorch"
 DEFAULT_SYMBOLS = ["TQQQ", "SQQQ", "SOXL", "SOXS"]
-
-
-@dataclass
-class ForecastResult:
-    point_return_pct: float
-    q10_return_pct: Optional[float]
-    q50_return_pct: Optional[float]
-    q90_return_pct: Optional[float]
-    probability_positive: Optional[float]
 
 
 @dataclass
@@ -38,84 +34,6 @@ class BacktestTrade:
     gross_return_pct: float
     realized_return_pct: float
     rule_status: str
-
-
-class TimesFMUnavailable(RuntimeError):
-    pass
-
-
-class TimesFMForecaster:
-    def __init__(self, model_id: str, max_context: int, max_horizon: int) -> None:
-        self.model_id = model_id
-        self.max_context = max_context
-        self.max_horizon = max_horizon
-        self.model = self._load_model(model_id, max_context, max_horizon)
-
-    def forecast(self, closes: list[float], horizon: int) -> ForecastResult:
-        import numpy as np
-
-        if len(closes) < 2:
-            raise ValueError("at least two closes are required")
-        if horizon > self.max_horizon:
-            raise ValueError(f"horizon {horizon} exceeds max_horizon {self.max_horizon}")
-
-        safe_closes = np.asarray([max(float(value), 1e-9) for value in closes], dtype=np.float32)
-        log_closes = np.log(safe_closes)
-        last_log = float(log_closes[-1])
-        point_forecast, quantile_forecast = self.model.forecast(horizon=horizon, inputs=[log_closes])
-
-        point_value = float(point_forecast[0][horizon - 1])
-        point_return = _log_forecast_to_return_pct(point_value, last_log)
-
-        q10 = q50 = q90 = probability_positive = None
-        if quantile_forecast is not None:
-            q_values = _quantile_values(quantile_forecast, horizon)
-            if q_values:
-                q10 = _log_forecast_to_return_pct(q_values.get("q10"), last_log)
-                q50 = _log_forecast_to_return_pct(q_values.get("q50"), last_log)
-                q90 = _log_forecast_to_return_pct(q_values.get("q90"), last_log)
-                probability_positive = _probability_positive(q_values, last_log)
-
-        if probability_positive is None:
-            probability_positive = 1.0 if point_return > 0 else 0.0
-        return ForecastResult(
-            point_return_pct=round(point_return, 4),
-            q10_return_pct=_round_optional(q10),
-            q50_return_pct=_round_optional(q50),
-            q90_return_pct=_round_optional(q90),
-            probability_positive=_round_optional(probability_positive),
-        )
-
-    def _load_model(self, model_id: str, max_context: int, max_horizon: int) -> Any:
-        try:
-            import torch
-            import timesfm
-        except Exception as exc:  # noqa: BLE001
-            raise TimesFMUnavailable(
-                "TimesFM dependencies are not installed. Run: "
-                "python -m pip install --index-url https://pypi.org/simple -r requirements-timesfm.txt"
-            ) from exc
-
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
-
-        try:
-            model_cls = getattr(timesfm, "TimesFM_2p5_200M_torch")
-            model = model_cls.from_pretrained(model_id)
-            model.compile(
-                timesfm.ForecastConfig(
-                    max_context=max_context,
-                    max_horizon=max_horizon,
-                    normalize_inputs=True,
-                    use_continuous_quantile_head=True,
-                    force_flip_invariance=True,
-                    infer_is_positive=True,
-                    fix_quantile_crossing=True,
-                )
-            )
-            return model
-        except Exception as exc:  # noqa: BLE001
-            raise TimesFMUnavailable(f"Failed to load TimesFM model {model_id}: {exc}") from exc
 
 
 def run_backtest(args: argparse.Namespace) -> dict:
@@ -162,6 +80,7 @@ def run_backtest(args: argparse.Namespace) -> dict:
         "summary": summary,
         "baselines": _build_baselines(clean_bars_by_symbol, args),
         "grid_search": _grid_search(forecast_rows, args) if args.grid else [],
+        "latest_forecast_matrix": _latest_forecast_matrix(forecast_rows, args),
         "trades": [asdict(item) for item in trades],
     }
 
@@ -208,7 +127,7 @@ def _backtest_symbol(symbol: str, bars: list[PriceBar], forecaster: TimesFMForec
     return output
 
 
-def _candidate_from_forecast(symbol: str, forecast: ForecastResult, args: argparse.Namespace) -> tuple[str, float, str]:
+def _candidate_from_forecast(symbol: str, forecast: TimesFMForecast, args: argparse.Namespace) -> tuple[str, float, str]:
     q50 = forecast.q50_return_pct if forecast.q50_return_pct is not None else forecast.point_return_pct
     q10 = forecast.q10_return_pct
     q90 = forecast.q90_return_pct
@@ -337,7 +256,7 @@ def _grid_search(rows: list[BacktestTrade], args: argparse.Namespace) -> list[di
                 returns = []
                 trade_count_by_symbol: dict[str, int] = {}
                 for row in rows:
-                    forecast = ForecastResult(**row.forecast)
+                    forecast = TimesFMForecast(**row.forecast)
                     action, _, _ = _candidate_from_forecast(row.symbol, forecast, grid_args)
                     if action == "NO_TRADE":
                         continue
@@ -377,6 +296,23 @@ def _summary_from_returns(returns: list[float]) -> dict:
         "avg_loss_pct": _round_optional(sum(losses) / len(losses)) if losses else None,
         "max_drawdown_pct": _max_drawdown(returns),
     }
+
+
+def _latest_forecast_matrix(rows: list[BacktestTrade], args: argparse.Namespace) -> dict:
+    latest_by_symbol: dict[str, BacktestTrade] = {}
+    for row in rows:
+        current = latest_by_symbol.get(row.symbol)
+        if current is None or row.decision_date > current.decision_date:
+            latest_by_symbol[row.symbol] = row
+    forecasts = {
+        symbol: TimesFMForecast(**row.forecast)
+        for symbol, row in latest_by_symbol.items()
+    }
+    return build_timesfm_forecast_matrix(
+        forecasts,
+        horizon_days=args.horizon,
+        q10_floor=args.max_adverse_threshold,
+    )
 
 
 def write_outputs(result: dict, reports_dir: Path = REPORTS_DIR) -> tuple[Path, Path]:
@@ -424,6 +360,30 @@ def render_markdown(result: dict) -> str:
             f"| {symbol} | {payload.get('trades', 0)} | {_fmt_pct_ratio(payload.get('win_rate'))} | "
             f"{_fmt_pct(payload.get('avg_return_pct'))} | {_fmt_pct(payload.get('total_compounded_return_pct'))} |"
         )
+    matrix = result.get("latest_forecast_matrix", {})
+    matrix_symbols = matrix.get("symbols", {})
+    if matrix_symbols:
+        lines.extend(
+            [
+                "",
+                "## Latest TimesFM Matrix",
+                "",
+                f"- Ranking: `{', '.join(matrix.get('ranking', [])) or 'none'}`",
+                f"- Warnings: `{', '.join(matrix.get('warnings', [])) or 'none'}`",
+                "",
+                "| Symbol | Hint | Score | q10 | q50 | q90 | Prob+ |",
+                "|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for symbol in ["TQQQ", "SQQQ", "SOXL", "SOXS"]:
+            payload = matrix_symbols.get(symbol, {})
+            if not payload:
+                continue
+            lines.append(
+                f"| {symbol} | `{payload.get('candidate_hint')}` | {payload.get('forecast_score')} | "
+                f"{_fmt_pct(payload.get('q10_return_pct'))} | {_fmt_pct(payload.get('q50_return_pct'))} | "
+                f"{_fmt_pct(payload.get('q90_return_pct'))} | {_fmt_pct_ratio(payload.get('probability_positive'))} |"
+            )
     baselines = result.get("baselines", {})
     lines.extend(
         [
@@ -532,39 +492,6 @@ def _validate_symbols(symbols: Iterable[str]) -> list[str]:
         if normalized not in output:
             output.append(normalized)
     return output
-
-
-def _quantile_values(quantile_forecast: Any, horizon: int) -> dict[str, float]:
-    values = quantile_forecast[0][horizon - 1]
-    length = len(values)
-    if length >= 10:
-        return {"q10": float(values[1]), "q50": float(values[5]), "q90": float(values[9])}
-    if length >= 9:
-        return {"q10": float(values[0]), "q50": float(values[4]), "q90": float(values[8])}
-    return {}
-
-
-def _probability_positive(q_values: dict[str, float], last_log: float) -> Optional[float]:
-    quantiles = [(0.10, q_values.get("q10")), (0.50, q_values.get("q50")), (0.90, q_values.get("q90"))]
-    clean = [(prob, value) for prob, value in quantiles if value is not None]
-    if not clean:
-        return None
-    threshold = last_log
-    if clean[0][1] >= threshold:
-        return 0.9
-    if clean[-1][1] <= threshold:
-        return 0.1
-    for (left_p, left_v), (right_p, right_v) in zip(clean, clean[1:]):
-        if left_v <= threshold <= right_v and right_v != left_v:
-            cdf = left_p + (right_p - left_p) * ((threshold - left_v) / (right_v - left_v))
-            return max(0.0, min(1.0, 1.0 - cdf))
-    return None
-
-
-def _log_forecast_to_return_pct(value: Optional[float], last_log: float) -> float:
-    if value is None:
-        return 0.0
-    return (math.exp(float(value) - last_log) - 1.0) * 100.0
 
 
 def _confidence(return_pct: float, probability: Optional[float]) -> float:
