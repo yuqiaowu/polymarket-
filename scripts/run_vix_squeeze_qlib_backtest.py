@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -17,10 +18,18 @@ START_DATE = datetime(2022, 1, 1)
 TRANSACTION_COST = 0.0005
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Run the daily TQQQ VIX squeeze backtest with the trained GRU forecaster.")
+    parser.add_argument("--model-dir", default="models/vix_gru", help="Directory containing vix_gru_model.pth and scaler files.")
+    return parser.parse_args()
+
+
 def run_qlib_backtest():
     print("Starting Qlib/GRU VIX Squeeze backtest: daily TQQQ, strict T+1 execution")
     df = _load_data(START_DATE, datetime.now())
-    engine = VixSqueezeQlibEngine()
+    args = _parse_args()
+    model_path = os.path.join(args.model_dir, "vix_gru_model.pth")
+    engine = VixSqueezeQlibEngine(model_path)
 
     if not engine.forecaster.is_available:
         print("WARNING: Qlib/GRU model files are missing. This run is a neutral fallback, not a real Qlib comparison.")

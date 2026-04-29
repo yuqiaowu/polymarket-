@@ -69,6 +69,6 @@ class QlibForecaster:
         with torch.no_grad():
             score = self.model(X_seq).item()
             
-        # Score normalization (Sigmoid-like)
-        prob_spike = 1 / (1 + np.exp(-score * 10))
+        # The model is trained with BCEWithLogitsLoss, so the raw output is a logit.
+        prob_spike = 1 / (1 + np.exp(-score))
         return prob_spike
