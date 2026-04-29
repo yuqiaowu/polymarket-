@@ -35,6 +35,7 @@ class BacktestTrade:
     forecast: dict
     entry_close: float
     exit_close: float
+    gross_return_pct: float
     realized_return_pct: float
     rule_status: str
 
@@ -122,16 +123,19 @@ def run_backtest(args: argparse.Namespace) -> dict:
     bars_by_symbol = fetch_daily_bars(symbols, period=args.period, timeout=args.timeout)
     forecaster = TimesFMForecaster(args.model, args.context, args.horizon)
 
-    trades: list[BacktestTrade] = []
+    forecast_rows: list[BacktestTrade] = []
     data_status = {}
+    clean_bars_by_symbol = {}
     for symbol in symbols:
         bars = _clean_bars(bars_by_symbol.get(symbol, []))
+        clean_bars_by_symbol[symbol] = bars
         data_status[symbol] = {"bar_count": len(bars), "first_date": bars[0].date if bars else None, "last_date": bars[-1].date if bars else None}
-        trades.extend(_backtest_symbol(symbol, bars, forecaster, args))
+        forecast_rows.extend(_backtest_symbol(symbol, bars, forecaster, args))
 
-    summary = _summary(trades)
+    trades = forecast_rows if args.include_no_trade else [item for item in forecast_rows if item.action != "NO_TRADE"]
+    summary = _summary(forecast_rows)
     return {
-        "schema_version": "timesfm_backtest_v0.1",
+        "schema_version": "timesfm_backtest_v0.2",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "model": {
             "model_id": args.model,
@@ -145,7 +149,7 @@ def run_backtest(args: argparse.Namespace) -> dict:
             "tradeable_symbols": symbols,
             "entry": "decision day close",
             "exit": f"close after {args.horizon} trading day(s)",
-            "costs": "not included",
+            "costs": f"{args.cost_bps} bps round-trip deducted from directional trades",
             "note": "Walk-forward forecast uses only bars available up to each decision date.",
         },
         "thresholds": {
@@ -156,6 +160,8 @@ def run_backtest(args: argparse.Namespace) -> dict:
         },
         "data_status": data_status,
         "summary": summary,
+        "baselines": _build_baselines(clean_bars_by_symbol, args),
+        "grid_search": _grid_search(forecast_rows, args) if args.grid else [],
         "trades": [asdict(item) for item in trades],
     }
 
@@ -179,12 +185,11 @@ def _backtest_symbol(symbol: str, bars: list[PriceBar], forecaster: TimesFMForec
 
         forecast = forecaster.forecast(closes, args.horizon)
         action, confidence, rule_status = _candidate_from_forecast(symbol, forecast, args)
-        if action == "NO_TRADE" and not args.include_no_trade:
-            continue
         if entry_bar.close is None or exit_bar.close is None:
             continue
 
-        realized = (float(exit_bar.close) / float(entry_bar.close) - 1.0) * 100.0
+        gross = (float(exit_bar.close) / float(entry_bar.close) - 1.0) * 100.0
+        realized = _apply_trade_cost(gross, args.cost_bps) if action != "NO_TRADE" else gross
         output.append(
             BacktestTrade(
                 symbol=symbol,
@@ -195,6 +200,7 @@ def _backtest_symbol(symbol: str, bars: list[PriceBar], forecaster: TimesFMForec
                 forecast=asdict(forecast),
                 entry_close=round(float(entry_bar.close), 4),
                 exit_close=round(float(exit_bar.close), 4),
+                gross_return_pct=round(gross, 4),
                 realized_return_pct=round(realized, 4),
                 rule_status=rule_status,
             )
@@ -267,6 +273,112 @@ def _return_stats(returns: list[float]) -> dict:
     }
 
 
+def _build_baselines(bars_by_symbol: dict[str, list[PriceBar]], args: argparse.Namespace) -> dict:
+    always_returns = []
+    ma20_returns = []
+    by_symbol = {}
+    for symbol, bars in bars_by_symbol.items():
+        windows = _baseline_windows(bars, args)
+        symbol_always = [_apply_trade_cost(item["gross_return_pct"], args.cost_bps) for item in windows]
+        symbol_ma20 = [
+            _apply_trade_cost(item["gross_return_pct"], args.cost_bps)
+            for item in windows
+            if item["entry_close"] > item["ma20"]
+        ]
+        always_returns.extend(symbol_always)
+        ma20_returns.extend(symbol_ma20)
+        by_symbol[symbol] = {
+            "always_hold": _return_stats(symbol_always),
+            "ma20_trend": _return_stats(symbol_ma20),
+        }
+    return {
+        "always_hold": _summary_from_returns(always_returns),
+        "ma20_trend": _summary_from_returns(ma20_returns),
+        "by_symbol": by_symbol,
+    }
+
+
+def _baseline_windows(bars: list[PriceBar], args: argparse.Namespace) -> list[dict]:
+    if len(bars) < args.context + args.horizon + 1:
+        return []
+    output = []
+    end_indexes = list(range(args.context, len(bars) - args.horizon + 1, args.step))
+    if args.max_windows:
+        end_indexes = end_indexes[-args.max_windows :]
+    for end_idx in end_indexes:
+        context_bars = bars[end_idx - args.context : end_idx]
+        entry_bar = bars[end_idx - 1]
+        exit_bar = bars[end_idx + args.horizon - 1]
+        ma_closes = [float(bar.close) for bar in context_bars[-20:] if bar.close is not None]
+        if len(ma_closes) < 20 or entry_bar.close is None or exit_bar.close is None:
+            continue
+        gross = (float(exit_bar.close) / float(entry_bar.close) - 1.0) * 100.0
+        output.append(
+            {
+                "entry_close": float(entry_bar.close),
+                "ma20": sum(ma_closes) / len(ma_closes),
+                "gross_return_pct": gross,
+            }
+        )
+    return output
+
+
+def _grid_search(rows: list[BacktestTrade], args: argparse.Namespace) -> list[dict]:
+    output = []
+    for positive in _float_list(args.grid_positive_thresholds):
+        for probability in _float_list(args.grid_probability_thresholds):
+            for adverse in _float_list(args.grid_max_adverse_thresholds):
+                grid_args = argparse.Namespace(
+                    positive_threshold=positive,
+                    negative_threshold=-abs(positive),
+                    probability_threshold=probability,
+                    max_adverse_threshold=adverse,
+                )
+                returns = []
+                trade_count_by_symbol: dict[str, int] = {}
+                for row in rows:
+                    forecast = ForecastResult(**row.forecast)
+                    action, _, _ = _candidate_from_forecast(row.symbol, forecast, grid_args)
+                    if action == "NO_TRADE":
+                        continue
+                    returns.append(_apply_trade_cost(row.gross_return_pct, args.cost_bps))
+                    trade_count_by_symbol[row.symbol] = trade_count_by_symbol.get(row.symbol, 0) + 1
+                stats = _summary_from_returns(returns)
+                output.append(
+                    {
+                        "positive_threshold_pct": positive,
+                        "probability_threshold": probability,
+                        "max_adverse_threshold_pct": adverse,
+                        "trade_count_by_symbol": trade_count_by_symbol,
+                        **stats,
+                    }
+                )
+    return sorted(
+        output,
+        key=lambda item: (
+            item.get("total_compounded_return_pct") is not None,
+            item.get("total_compounded_return_pct") or -10**9,
+            item.get("directional_trades") or 0,
+        ),
+        reverse=True,
+    )
+
+
+def _summary_from_returns(returns: list[float]) -> dict:
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value <= 0]
+    return {
+        "directional_trades": len(returns),
+        "win_rate": _round_optional(len(wins) / len(returns)) if returns else None,
+        "avg_return_pct": _round_optional(sum(returns) / len(returns)) if returns else None,
+        "median_return_pct": _median(returns),
+        "total_compounded_return_pct": _compound_return(returns),
+        "avg_win_pct": _round_optional(sum(wins) / len(wins)) if wins else None,
+        "avg_loss_pct": _round_optional(sum(losses) / len(losses)) if losses else None,
+        "max_drawdown_pct": _max_drawdown(returns),
+    }
+
+
 def write_outputs(result: dict, reports_dir: Path = REPORTS_DIR) -> tuple[Path, Path]:
     reports_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -291,6 +403,7 @@ def render_markdown(result: dict) -> str:
         f"- Context: `{model.get('context')}` daily bars",
         f"- Horizon: `{model.get('horizon_days')}` trading day(s)",
         f"- Period: `{model.get('period')}`",
+        f"- Cost: `{result.get('policy', {}).get('costs')}`",
         "",
         "## Summary",
         "",
@@ -311,6 +424,41 @@ def render_markdown(result: dict) -> str:
             f"| {symbol} | {payload.get('trades', 0)} | {_fmt_pct_ratio(payload.get('win_rate'))} | "
             f"{_fmt_pct(payload.get('avg_return_pct'))} | {_fmt_pct(payload.get('total_compounded_return_pct'))} |"
         )
+    baselines = result.get("baselines", {})
+    lines.extend(
+        [
+            "",
+            "## Baselines",
+            "",
+            "| Baseline | Trades | Win rate | Avg return | Compounded return | Max drawdown |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for name in ["always_hold", "ma20_trend"]:
+        payload = baselines.get(name, {})
+        lines.append(
+            f"| `{name}` | {payload.get('directional_trades', 0)} | {_fmt_pct_ratio(payload.get('win_rate'))} | "
+            f"{_fmt_pct(payload.get('avg_return_pct'))} | {_fmt_pct(payload.get('total_compounded_return_pct'))} | "
+            f"{_fmt_pct(payload.get('max_drawdown_pct'))} |"
+        )
+    grid = result.get("grid_search", [])
+    if grid:
+        lines.extend(
+            [
+                "",
+                "## Grid Search Top 10",
+                "",
+                "| Rank | Pos threshold | Prob threshold | q10 floor | Trades | Win rate | Avg return | Compounded | Max DD |",
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for idx, item in enumerate(grid[:10], start=1):
+            lines.append(
+                f"| {idx} | {_fmt_pct(item.get('positive_threshold_pct'))} | {_fmt_pct_ratio(item.get('probability_threshold'))} | "
+                f"{_fmt_pct(item.get('max_adverse_threshold_pct'))} | {item.get('directional_trades', 0)} | "
+                f"{_fmt_pct_ratio(item.get('win_rate'))} | {_fmt_pct(item.get('avg_return_pct'))} | "
+                f"{_fmt_pct(item.get('total_compounded_return_pct'))} | {_fmt_pct(item.get('max_drawdown_pct'))} |"
+            )
     lines.extend(["", "## Recent Trades", "", "| Date | Exit | Symbol | Action | Forecast q50 | Prob+ | Realized |", "|---|---|---|---|---:|---:|---:|"])
     directional = [item for item in result.get("trades", []) if item.get("action") != "NO_TRADE"]
     for item in directional[-20:]:
@@ -339,6 +487,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative-threshold", type=float, default=-1.5, help="Forecast threshold for rejecting a symbol.")
     parser.add_argument("--probability-threshold", type=float, default=0.60, help="Minimum positive probability for a candidate.")
     parser.add_argument("--max-adverse-threshold", type=float, default=-2.0, help="Minimum acceptable q10 return for a candidate.")
+    parser.add_argument("--cost-bps", type=float, default=10.0, help="Round-trip cost in basis points deducted from directional trades.")
+    parser.add_argument("--grid", action="store_true", help="Run threshold grid search over cached TimesFM forecast rows.")
+    parser.add_argument("--grid-positive-thresholds", default="0,0.5,1.0,1.5,2.0", help="Comma-separated q50/point return thresholds.")
+    parser.add_argument("--grid-probability-thresholds", default="0.5,0.55,0.6,0.65", help="Comma-separated positive probability thresholds.")
+    parser.add_argument("--grid-max-adverse-thresholds", default="-20,-10,-5,-2", help="Comma-separated q10 floor thresholds.")
     parser.add_argument("--include-no-trade", action="store_true", help="Include NO_TRADE rows in output.")
     return parser.parse_args()
 
@@ -418,6 +571,20 @@ def _confidence(return_pct: float, probability: Optional[float]) -> float:
     prob = probability if probability is not None else 0.5
     raw = 0.35 + min(abs(return_pct), 8.0) / 20.0 + max(0.0, prob - 0.5)
     return round(max(0.0, min(0.9, raw)), 4)
+
+
+def _apply_trade_cost(gross_return_pct: float, cost_bps: float) -> float:
+    return gross_return_pct - cost_bps / 100.0
+
+
+def _float_list(raw: str) -> list[float]:
+    output = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        output.append(float(item))
+    return output
 
 
 def _compound_return(returns: list[float]) -> Optional[float]:
