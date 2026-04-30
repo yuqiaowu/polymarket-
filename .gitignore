@@ -5,4 +5,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
-reports/
+reports/*
+!reports/
+!reports/vix_squeeze_timesfm_report.png
+!reports/vix_squeeze_timesfm_summary.md

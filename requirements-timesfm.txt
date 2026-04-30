@@ -1,4 +1,4 @@
-# Optional dependencies for TimesFM walk-forward backtests.
+# Optional dependencies for the TimesFM VIX squeeze backtest.
 # Install separately because model/runtime dependencies are heavy.
 #
 # Recommended:
@@ -11,6 +11,6 @@ torch>=2.2.0
 numpy>=1.26.0
 
 # Do not use the old PyPI `timesfm==1.0.0` package for this project; it does
-# not expose the TimesFM 2.5 torch API used by scripts/run_timesfm_backtest.py.
+# not expose the TimesFM 2.5 torch API used by scripts/run_vix_squeeze_backtest.py.
 # The current Google Research code is installed from GitHub.
 timesfm[torch] @ git+https://github.com/google-research/timesfm.git

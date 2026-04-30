@@ -5,10 +5,6 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 
-TIMESFM_SCHEMA_VERSION = "timesfm_forecast_v0.1"
-TIMESFM_TRADE_SYMBOLS = ["TQQQ", "SQQQ", "SOXL", "SOXS"]
-
-
 @dataclass
 class TimesFMForecast:
     point_return_pct: float
@@ -97,82 +93,6 @@ class TimesFMForecaster:
             return model
         except Exception as exc:  # noqa: BLE001
             raise TimesFMUnavailable(f"Failed to load TimesFM model {model_id}: {exc}") from exc
-
-
-def build_timesfm_forecast_matrix(
-    forecasts: dict[str, TimesFMForecast],
-    horizon_days: int,
-    q10_floor: float = -10.0,
-) -> dict:
-    symbols = {}
-    warnings = []
-    for symbol in TIMESFM_TRADE_SYMBOLS:
-        forecast = forecasts.get(symbol)
-        if forecast is None:
-            warnings.append(f"MISSING_TIMESFM_FORECAST_{symbol}")
-            continue
-        score = forecast_score(forecast, q10_floor=q10_floor)
-        payload = forecast.to_dict()
-        payload["forecast_score"] = score
-        payload["candidate_hint"] = candidate_hint(forecast, q10_floor=q10_floor)
-        symbols[symbol] = payload
-
-    ranking = sorted(symbols.keys(), key=lambda item: symbols[item].get("forecast_score", -999.0), reverse=True)
-    conflicts = _forecast_conflicts(symbols)
-    return {
-        "schema_version": TIMESFM_SCHEMA_VERSION,
-        "strategy": "timesfm_forecast",
-        "horizon": f"{horizon_days}D",
-        "symbols": symbols,
-        "ranking": ranking,
-        "warnings": warnings + conflicts,
-        "policy": (
-            "TimesFM scores all four allowed leveraged ETF symbols. It ranks and filters candidates, "
-            "but does not grant trade permission by itself."
-        ),
-    }
-
-
-def forecast_score(forecast: TimesFMForecast, q10_floor: float = -10.0) -> float:
-    q50 = forecast.q50_return_pct if forecast.q50_return_pct is not None else forecast.point_return_pct
-    probability = forecast.probability_positive if forecast.probability_positive is not None else 0.5
-    q10 = forecast.q10_return_pct
-    normalized_q50 = max(-1.0, min(1.0, q50 / 5.0))
-    probability_edge = max(-1.0, min(1.0, (probability - 0.5) * 4.0))
-    if q10 is None:
-        downside_adjustment = 0.0
-    elif q10 >= q10_floor:
-        downside_adjustment = min(1.0, (q10 - q10_floor) / abs(q10_floor or -1.0))
-    else:
-        downside_adjustment = -min(1.0, (q10_floor - q10) / abs(q10_floor or -1.0))
-    score = 0.45 * normalized_q50 + 0.35 * probability_edge + 0.20 * downside_adjustment
-    return round(max(-1.0, min(1.0, score)), 4)
-
-
-def candidate_hint(forecast: TimesFMForecast, q10_floor: float = -10.0) -> str:
-    q50 = forecast.q50_return_pct if forecast.q50_return_pct is not None else forecast.point_return_pct
-    probability = forecast.probability_positive if forecast.probability_positive is not None else 0.5
-    q10 = forecast.q10_return_pct
-    if probability >= 0.55 and q50 > 0 and (q10 is None or q10 >= q10_floor):
-        return "SUPPORT"
-    if probability >= 0.50 and q50 >= 0:
-        return "WEAK_SUPPORT"
-    if probability < 0.45 or q50 < 0:
-        return "OPPOSE"
-    return "NEUTRAL"
-
-
-def _forecast_conflicts(symbols: dict[str, dict]) -> list[str]:
-    warnings = []
-    if _is_support(symbols.get("TQQQ")) and _is_support(symbols.get("SQQQ")):
-        warnings.append("FORECAST_CONFLICT_TQQQ_SQQQ")
-    if _is_support(symbols.get("SOXL")) and _is_support(symbols.get("SOXS")):
-        warnings.append("FORECAST_CONFLICT_SOXL_SOXS")
-    return warnings
-
-
-def _is_support(payload: Optional[dict]) -> bool:
-    return bool(payload and payload.get("candidate_hint") in {"SUPPORT", "WEAK_SUPPORT"})
 
 
 def _quantile_values(quantile_forecast: Any, horizon: int) -> dict[str, float]:
